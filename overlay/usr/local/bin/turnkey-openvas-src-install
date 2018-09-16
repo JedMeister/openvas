@@ -1,0 +1,114 @@
+#!/bin/bash -e
+
+[[ -z $DEBUG ]] || set -x
+
+SRC=/usr/local/src/openvas
+
+GH_URL=https://github.com/greenbone
+GH_API=https://api.github.com/repos/greenbone
+REPOS="gvm-libs openvas-scanner gvm gsa gvm-tools ospd openvas-smb"
+
+build_deps_list=/tmp/openvas-build-deps.list
+BUILD_DEPS="jq cmake bison pkg-config libglib2.0-dev libgpgme-dev libgnutls28-dev
+    uuid-dev libssh-gcrypt-dev libhiredis-dev libpcap-dev libksba-dev
+    libldap2-dev libsnmp-dev doxygen xmltoman libsql-translator-perl 
+    libsqlite3-dev xsltproc libcgi-pm-perl libgd-perl libmicrohttpd-dev
+    libxml2-dev libxslt1-dev python3-dev libffi-dev libssl-dev heimdal-multidev
+    libpopt-dev gcc-mingw-w64-i686"
+
+PY_DEP="python3-paramiko python3-lxml python3-dialog python3-defusedxml
+    python3-setuptools"
+
+_install() {
+    if [[ $# > 0 ]]; then
+        apt-get update -q
+        DEBIAN_FRONTEND=noninteractive apt-get -y \
+        -o DPkg::Options::=--force-confdef \
+        -o DPkg::Options::=--force-confold \
+        install $@
+    fi
+}
+
+install() {
+    if [[ $1 == '--build-deps' ]]; then
+        save=y
+        shift
+    else
+        unset save
+    fi
+    unset PKGS
+    for pkg in $@; do
+        status=$(dpkg-query --show --showformat='${db:Status-Status}\n' $pkg) \
+            || unset status
+        if [[ $status != installed ]]; then
+            [[ -z $save ]] || echo $PKG >> $build_deps_list
+            PKGS="$PKGS $pkg"
+        fi
+    done
+    _install $PKGS
+}
+
+_remove() {
+    apt-get remove -y $@
+    apt autoremove -y
+    apt clean
+}
+
+remove() {
+    if [[ $1 == '--build-deps' ]]; then
+        build_deps=$(cat $build_deps_list)
+        shift
+    else
+        unset build_deps
+    fi
+    _remove $@ $build_deps
+}
+
+clone() {
+    json=$(curl --silent $PROXY "$GH_API/$1/releases/latest")
+    latest=$(echo $json | jq -r '.target_commitish')
+    if [[ $latest == master ]]; then
+        branch=master
+        latest=$(echo $json | jq -r '.tag_name')
+        unset depth
+    else
+        branch=$latest
+        depth="--depth=1"
+    fi
+    if [[ ! -d $1 ]]; then
+        git clone $depth --branch $latest $GH_URL/$1
+        cd $1
+    else
+        cd $1
+        git remote set-branches origin $branch || true
+        git fetch origin $branch
+        git checkout $latest
+    fi
+}
+
+install --build-deps $BUILD_DEPS
+install $PY_DEPS
+
+mkdir -p $SRC
+for repo in $REPOS; do
+    cd $SRC
+    clone $repo
+    if [[ -f CMakeLists.txt ]]; then
+        mkdir -p build
+        cd build
+        cmake ..
+        make
+        [[ $repo == openvas-smb ]] || make doc
+        make install
+    elif [[ -f setup.py ]]; then
+        python3 setup.py install
+    else
+        echo "Error: unknown repo: $PWD"
+        exit 1
+    fi
+done
+
+#if [[ -z $DEBUG ]]; then
+#    rm -rf $SRC
+#    remove $BUILD_DEPS
+#fi
